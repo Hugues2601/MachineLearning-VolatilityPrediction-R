@@ -1,0 +1,565 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+```{r}
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(tidymodels)
+library(ranger)
+library(corrplot)
+library(ggplot2)
+library(gridExtra)
+library(doParallel)
+library(xgboost)
+library(kernlab)
+library(randomForest)
+```
+
+
+```{r}
+
+names(spx_macro)
+
+num_observations <- nrow(spx_macro)
+print(paste("Number of observations:", num_observations))
+
+
+columns_to_use <- c("date", "symbol", "name", "close", "vol_1y", "revenue", "mkt_cap", 
+                    "rec_mean", "p2b", "d2e", "prof_marg", "dy", "esg", "scope_1", "scope_2", 
+                    "scope_3", "country_HQ", "country_Risk", "sector", "return", "fwd_return", 
+                    "inflation", "gdp_growth", "unemployment", "fed_rate")
+
+
+selected_data <- spx_macro %>%
+  select(all_of(columns_to_use)) %>%
+  drop_na()
+
+
+cor_matrix <- cor(selected_data %>% select(-c(date, symbol, name, country_HQ, country_Risk, sector)))
+
+
+cor_target <- cor_matrix[, "vol_1y"]
+
+
+cor_df <- data.frame(
+  Variable = names(cor_target),
+  Correlation = cor_target
+)
+
+
+cor_df <- cor_df[cor_df$Variable != "vol_1y", ]
+
+ggplot(cor_df, aes(x = reorder(Variable, Correlation), y = Correlation)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Correlation of Each Variable with vol_1y",
+       x = "Variable",
+       y = "Correlation") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+
+
+ggsave("correlation_plot.png", width = 12, height = 16)
+```
+```{r}
+# Define the columns to use based on the new dataset
+columns_to_use <- c("date", "symbol", "name", "close", "vol_1y", "revenue", "mkt_cap", 
+                    "rec_mean", "p2b", "d2e", "prof_marg", "dy", "esg", "scope_1", "scope_2", 
+                    "scope_3", "country_HQ", "country_Risk", "sector", "return", "fwd_return", 
+                    "inflation", "gdp_growth", "unemployment", "fed_rate")
+
+# Select the specified columns
+selected_data <- spx_macro %>%
+  select(all_of(columns_to_use)) %>%
+  drop_na()
+
+set.seed(123)
+data_split <- initial_split(selected_data, prop = 0.8)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+recipe <- recipe(vol_1y ~ ., data = train_data) %>%
+  step_rm(date, symbol, name, country_HQ, country_Risk, sector) %>% 
+  step_normalize(all_predictors())
+
+model_spec <- linear_reg() %>%
+  set_engine("lm")
+
+workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(model_spec)
+
+
+model_fit <- workflow %>%
+  fit(data = train_data)
+
+
+predictions <- model_fit %>%
+  predict(new_data = test_data) %>%
+  bind_cols(test_data)
+
+
+metrics <- predictions %>%
+  metrics(truth = vol_1y, estimate = .pred)
+
+print(metrics)
+
+ggplot(predictions, aes(x = .pred, y = vol_1y)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Predicted vs Actual vol_1y",
+       x = "Predicted vol_1y",
+       y = "Actual vol_1y") +
+  theme_minimal()
+
+ggsave("residual_plot.png", width = 8, height = 6)
+
+```
+
+```{r}
+
+sample_proportion <- 0.05 
+
+set.seed(123) 
+sampled_data <- spx_macro %>%
+  sample_frac(sample_proportion)
+
+print(paste("Number of observations in sampled data:", nrow(sampled_data)))
+
+selected_data <- sampled_data %>%
+  select(all_of(columns_to_use)) %>%
+  drop_na()
+
+set.seed(123)
+data_split <- initial_split(selected_data, prop = 0.8)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+
+recipe <- recipe(vol_1y ~ ., data = train_data) %>%
+  step_rm(date, symbol, name, country_HQ, country_Risk, sector) %>% 
+  step_normalize(all_predictors())
+
+model_spec <- rand_forest(
+  mtry = tune(),
+  trees = 100, 
+  min_n = tune()
+) %>%
+  set_engine("randomForest") %>%
+  set_mode("regression")
+
+
+workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(model_spec)
+
+tune_grid <- grid_regular(
+  mtry(range = c(2, 10)),
+  min_n(range = c(5, 20)),
+  levels = 5
+)
+
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+set.seed(123)
+tune_res <- tune_grid(
+  workflow,
+  resamples = vfold_cv(train_data, v = 3),
+  grid = tune_grid,
+  control = control_grid(verbose = TRUE, save_pred = TRUE)
+)
+
+
+stopCluster(cl)
+registerDoSEQ()
+
+best_model <- tune_res %>% select_best(metric = "rmse")
+print(best_model)
+
+final_workflow <- workflow %>% finalize_workflow(best_model)
+
+final_fit <- final_workflow %>% fit(data = train_data)
+
+predictions <- final_fit %>%
+  predict(new_data = test_data) %>%
+  bind_cols(test_data)
+
+metrics <- predictions %>%
+  metrics(truth = vol_1y, estimate = .pred)
+
+print(metrics)
+
+ggplot(predictions, aes(x = .pred, y = vol_1y)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Predicted vs Actual vol_1y",
+       x = "Predicted vol_1y",
+       y = "Actual vol_1y") +
+  theme_minimal()
+
+
+ggsave("residual_plot.png", width = 8, height = 6)
+```
+
+
+```{r}
+
+sample_proportion <- 0.05 
+
+set.seed(123)
+sampled_data <- spx_macro %>%
+  sample_frac(sample_proportion)
+
+print(paste("Number of observations in sampled data:", nrow(sampled_data)))
+
+selected_data <- sampled_data %>%
+  select(all_of(columns_to_use)) %>%
+  drop_na()
+
+set.seed(123)
+data_split <- initial_split(selected_data, prop = 0.8)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+recipe <- recipe(vol_1y ~ ., data = train_data) %>%
+  step_rm(date, symbol, name, country_HQ, country_Risk, sector) %>%
+  step_normalize(all_predictors())
+
+
+model_spec <- boost_tree(
+  trees = 100,  
+  tree_depth = tune(),
+  learn_rate = tune(),
+  mtry = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+
+workflow <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(model_spec)
+
+tune_grid <- grid_regular(
+  tree_depth(range = c(3, 6)),  
+  learn_rate(range = c(0.01, 0.1)), 
+  mtry(range = c(3, 6)),  
+  levels = 3  
+)
+
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+
+set.seed(123)
+tune_res <- tune_grid(
+  workflow,
+  resamples = vfold_cv(train_data, v = 3), 
+  control = control_grid(verbose = TRUE, save_pred = TRUE)
+)
+
+stopCluster(cl)
+registerDoSEQ()
+
+best_model <- tune_res %>% select_best(metric = "rmse")
+print(best_model)
+
+final_workflow <- workflow %>% finalize_workflow(best_model)
+
+final_fit <- final_workflow %>% fit(data = train_data)
+
+predictions <- final_fit %>%
+  predict(new_data = test_data) %>%
+  bind_cols(test_data)
+
+metrics <- predictions %>%
+  metrics(truth = vol_1y, estimate = .pred)
+
+print(metrics)
+
+ggplot(predictions, aes(x = .pred, y = vol_1y)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Predicted vs Actual vol_1y",
+       x = "Predicted vol_1y",
+       y = "Actual vol_1y") +
+  theme_minimal()
+
+ggsave("residual_plot.png", width = 8, height = 6)
+
+
+```
+
+
+```{r}
+sample_proportion <- 0.05 
+
+set.seed(123) 
+sampled_data <- spx_macro %>%
+  sample_frac(sample_proportion)
+
+print(paste("Number of observations in sampled data:", nrow(sampled_data)))
+
+selected_data <- sampled_data %>%
+  select(all_of(columns_to_use)) %>%
+  drop_na()
+
+set.seed(123)
+data_split <- initial_split(selected_data, prop = 0.8)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+recipe <- recipe(vol_1y ~ ., data = train_data) %>%
+  step_rm(date, symbol, name, country_HQ, country_Risk, sector) %>%
+  step_normalize(all_predictors())
+
+rf_spec <- rand_forest(
+  mtry = tune(),
+  trees = 100,  
+  min_n = tune()
+) %>%
+  set_engine("randomForest") %>%
+  set_mode("regression")
+
+xgb_spec <- boost_tree(
+  trees = 100, 
+  tree_depth = tune(),
+  learn_rate = tune(),
+  mtry = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+rf_grid <- grid_regular(
+  mtry(range = c(2, 10)),
+  min_n(range = c(5, 20)),
+  levels = 3
+)
+
+xgb_grid <- grid_regular(
+  tree_depth(range = c(3, 6)),
+  learn_rate(range = c(0.01, 0.1)),
+  mtry(range = c(3, 6)),
+  levels = 3
+)
+
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+set.seed(123)
+rf_tune_res <- tune_grid(
+  workflow() %>% add_recipe(recipe) %>% add_model(rf_spec),
+  resamples = vfold_cv(train_data, v = 3),  
+  grid = rf_grid,
+  control = control_grid(verbose = TRUE, save_pred = TRUE)
+)
+
+set.seed(123)
+xgb_tune_res <- tune_grid(
+  workflow() %>% add_recipe(recipe) %>% add_model(xgb_spec),
+  resamples = vfold_cv(train_data, v = 3), 
+  grid = xgb_grid,
+  control = control_grid(verbose = TRUE, save_pred = TRUE)
+)
+
+
+stopCluster(cl)
+registerDoSEQ()
+
+best_rf_model <- rf_tune_res %>% select_best(metric = "rmse")
+best_xgb_model <- xgb_tune_res %>% select_best(metric = "rmse")
+
+
+final_rf_workflow <- workflow() %>% add_recipe(recipe) %>% add_model(rf_spec) %>% finalize_workflow(best_rf_model)
+final_xgb_workflow <- workflow() %>% add_recipe(recipe) %>% add_model(xgb_spec) %>% finalize_workflow(best_xgb_model)
+
+final_rf_fit <- final_rf_workflow %>% fit(data = train_data)
+final_xgb_fit <- final_xgb_workflow %>% fit(data = train_data)
+
+rf_predictions <- final_rf_fit %>%
+  predict(new_data = test_data) %>%
+  bind_cols(test_data %>% select(date, symbol, name, vol_1y)) %>%
+  rename(rf_pred = .pred)
+
+xgb_predictions <- final_xgb_fit %>%
+  predict(new_data = test_data) %>%
+  bind_cols(test_data %>% select(date, symbol, name, vol_1y)) %>%
+  rename(xgb_pred = .pred)
+
+
+combined_predictions <- rf_predictions %>%
+  inner_join(xgb_predictions, by = c("date", "symbol", "name", "vol_1y")) %>%
+  mutate(ensemble_pred = (rf_pred + xgb_pred) / 2)
+
+ensemble_metrics <- combined_predictions %>%
+  metrics(truth = vol_1y, estimate = ensemble_pred)
+
+print(ensemble_metrics)
+
+
+ggplot(combined_predictions, aes(x = ensemble_pred, y = vol_1y)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Predicted vs Actual vol_1y (Ensemble)",
+       x = "Predicted vol_1y",
+       y = "Actual vol_1y") +
+  theme_minimal()
+
+
+ggsave("ensemble_residual_plot.png", width = 8, height = 6)
+
+```
+
+
+```{r}
+
+sample_proportion <- 0.05 
+
+
+set.seed(123) 
+sampled_data <- spx_macro %>%
+  sample_frac(sample_proportion)
+
+
+print(paste("Number of observations in sampled data:", nrow(sampled_data)))
+
+
+selected_data <- sampled_data %>%
+  select(all_of(columns_to_use)) %>%
+  drop_na()
+
+
+set.seed(123)
+data_split <- initial_split(selected_data, prop = 0.8)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+
+recipe <- recipe(vol_1y ~ ., data = train_data) %>%
+  step_rm(date, symbol, name, country_HQ, country_Risk, sector) %>%
+  step_normalize(all_predictors())
+
+
+rf_spec <- rand_forest(
+  mtry = tune(),
+  trees = 100,  
+  min_n = tune()
+) %>%
+  set_engine("randomForest") %>%
+  set_mode("regression")
+
+xgb_spec <- boost_tree(
+  trees = 100,  
+  tree_depth = tune(),
+  learn_rate = tune(),
+  mtry = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+rf_grid <- grid_regular(
+  mtry(range = c(2, 10)),
+  min_n(range = c(5, 20)),
+  levels = 3
+)
+
+xgb_grid <- grid_regular(
+  tree_depth(range = c(3, 6)),
+  learn_rate(range = c(0.01, 0.1)),
+  mtry(range = c(3, 6)),
+  levels = 3
+)
+
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+set.seed(123)
+rf_tune_res <- tune_grid(
+  workflow() %>% add_recipe(recipe) %>% add_model(rf_spec),
+  resamples = vfold_cv(train_data, v = 3),  
+  grid = rf_grid,
+  control = control_grid(verbose = TRUE, save_pred = TRUE)
+)
+
+set.seed(123)
+xgb_tune_res <- tune_grid(
+  workflow() %>% add_recipe(recipe) %>% add_model(xgb_spec),
+  resamples = vfold_cv(train_data, v = 3), 
+  grid = xgb_grid,
+  control = control_grid(verbose = TRUE, save_pred = TRUE)
+)
+
+
+stopCluster(cl)
+registerDoSEQ()
+
+best_rf_model <- rf_tune_res %>% select_best(metric = "rmse")
+best_xgb_model <- xgb_tune_res %>% select_best(metric = "rmse")
+
+final_rf_workflow <- workflow() %>% add_recipe(recipe) %>% add_model(rf_spec) %>% finalize_workflow(best_rf_model)
+final_xgb_workflow <- workflow() %>% add_recipe(recipe) %>% add_model(xgb_spec) %>% finalize_workflow(best_xgb_model)
+
+final_rf_fit <- final_rf_workflow %>% fit(data = train_data)
+final_xgb_fit <- final_xgb_workflow %>% fit(data = train_data)
+
+rf_train_predictions <- final_rf_fit %>%
+  predict(new_data = train_data) %>%
+  bind_cols(train_data %>% select(date, symbol, name, vol_1y)) %>%
+  rename(rf_pred = .pred)
+
+xgb_train_predictions <- final_xgb_fit %>%
+  predict(new_data = train_data) %>%
+  bind_cols(train_data %>% select(date, symbol, name, vol_1y)) %>%
+  rename(xgb_pred = .pred)
+
+meta_train_data <- rf_train_predictions %>%
+  inner_join(xgb_train_predictions, by = c("date", "symbol", "name", "vol_1y")) %>%
+  select(vol_1y, rf_pred, xgb_pred)
+
+meta_model <- linear_reg() %>%
+  set_engine("lm") %>%
+  fit(vol_1y ~ rf_pred + xgb_pred, data = meta_train_data)
+
+rf_test_predictions <- final_rf_fit %>%
+  predict(new_data = test_data) %>%
+  bind_cols(test_data %>% select(date, symbol, name, vol_1y)) %>%
+  rename(rf_pred = .pred)
+
+xgb_test_predictions <- final_xgb_fit %>%
+  predict(new_data = test_data) %>%
+  bind_cols(test_data %>% select(date, symbol, name, vol_1y)) %>%
+  rename(xgb_pred = .pred)
+
+meta_test_data <- rf_test_predictions %>%
+  inner_join(xgb_test_predictions, by = c("date", "symbol", "name", "vol_1y")) %>%
+  select(vol_1y, rf_pred, xgb_pred)
+
+meta_test_predictions <- predict(meta_model, new_data = meta_test_data) %>%
+  bind_cols(meta_test_data)
+
+stacked_metrics <- meta_test_predictions %>%
+  metrics(truth = vol_1y, estimate = .pred)
+
+print(stacked_metrics)
+
+ggplot(meta_test_predictions, aes(x = .pred, y = vol_1y)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Predicted vs Actual vol_1y (Stacked Ensemble)",
+       x = "Predicted vol_1y",
+       y = "Actual vol_1y") +
+  theme_minimal()
+
+ggsave("stacked_ensemble_residual_plot.png", width = 8, height = 6)
+```
