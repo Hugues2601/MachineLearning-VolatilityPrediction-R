@@ -1,30 +1,43 @@
 ---
 title: "R Notebook"
-output: html_notebook
+output:
+  html_document:
+    df_print: paged
 ---
 
-This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+## Introduction
 
-Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+In the financial markets, share prices are affected by a large number of macroeconomic factors (interest rate levels, inflation, unemployment rates, etc.), geopolitical factors (international conflicts, economic sanctions, etc.) and internal company factors (changes in management, mergers and acquisitions, etc.). As a result, certain situations can cause financial markets to become extremely volatile.
+
+Measuring historical and implied volatility is very important, as it enables us to measure the risks associated with asset price movements. Predicting volatility makes it possible not only to anticipate market movements, but also to price certain derivatives, such as options.
+
+Therefore, the aim of this project is to predict the volatility of the S&P500 as accurately as possible, using machine learning tools
+
+
 ```{r}
-library(tidyverse)
-library(lubridate)
-library(caret)
-library(tidymodels)
-library(ranger)
-library(corrplot)
-library(ggplot2)
-library(gridExtra)
-library(doParallel)
-library(xgboost)
-library(kernlab)
-library(randomForest)
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(tidymodels))
+suppressPackageStartupMessages(library(ranger))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(gridExtra))
+suppressPackageStartupMessages(library(doParallel))
+suppressPackageStartupMessages(library(xgboost))
+suppressPackageStartupMessages(library(randomForest))
 ```
 
+# Data sets and correlation
+
+The proposed dataset contains various information on the stocks making up the s&p500. It includes company-specific factors (historical volatility, budget capitalization, closing price, etc.) as well as macro-economic data for the corresponding dates (inflation, key rates, etc.).
 
 ```{r}
-
+load("C:/Users/hugue/Downloads/spx_macro.RData")
+head(spx_macro)
 names(spx_macro)
+
+```
+In an attempt to predict volatility, the first step is to analyze the correlation between each column and the target (vol_1y), in order to keep only those columns that could have a significant impact on the model's accuracy.
+
+```{r}
 
 num_observations <- nrow(spx_macro)
 print(paste("Number of observations:", num_observations))
@@ -70,50 +83,104 @@ ggplot(cor_df, aes(x = reorder(Variable, Correlation), y = Correlation)) +
 
 
 ggsave("correlation_plot.png", width = 12, height = 16)
+
 ```
+As can be seen above, the first observation is that none of the variables appear to be highly correlated (positively or negatively) with the target column (vol_1y). Before choosing which columns to keep, we also need to analyze multicollinearity between variables, using the VIF test (Variance Inflation Factors).
+
+
 ```{r}
-# Define the columns to use based on the new dataset
-columns_to_use <- c("date", "symbol", "name", "close", "vol_1y", "revenue", "mkt_cap", 
-                    "rec_mean", "p2b", "d2e", "prof_marg", "dy", "esg", "scope_1", "scope_2", 
-                    "scope_3", "country_HQ", "country_Risk", "sector", "return", "fwd_return", 
-                    "inflation", "gdp_growth", "unemployment", "fed_rate")
+numeric_columns <- sapply(spx_macro, is.numeric)
+numeric_data <- spx_macro[, numeric_columns]
+print(names(numeric_data))
 
-# Select the specified columns
-selected_data <- spx_macro %>%
-  select(all_of(columns_to_use)) %>%
-  drop_na()
+alias_model <- lm(vol_1y ~ ., data = numeric_data)
+colinear_columns <- alias(alias_model)$Complete
 
+if (length(colinear_columns) > 0) {
+  numeric_data <- numeric_data %>% select(-one_of(names(colinear_columns)))
+}
+
+vif_model <- lm(vol_1y ~ ., data = numeric_data)
+vif_values <- vif(vif_model)
+
+vif_df <- data.frame(
+  Variable = names(vif_values),
+  VIF = vif_values
+)
+
+ggplot(vif_df, aes(x = reorder(Variable, VIF), y = VIF)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Variance Inflation Factors (VIF)",
+       x = "Variable",
+       y = "VIF") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+
+ggsave("vif_plot.png", width = 12, height = 8)
+
+```
+As can be seen from the graph above, none of the independent variables has an VIF greater than 5, meaning that none of these variables show signs of strong multicollinearity with the others.
+
+Thus, in order to simplify the machine learning model as much as possible, reduce complexity and avoid long computation times, we will keep here the variables most correlated with vol_1y, i.e. :
+
+- return
+- fwd_return
+- fed_rate
+- inflation
+- d2e
+- dy
+- prof_marg
+- revenue
+
+# First linear regression model
+
+The first model we're going to run here is a relatively simple one: a basic linear regression model in which the dataset is split into two parts: one part for training the model (here 70% of the dataset) and a second part for testing the model (30%). The regression model is created using linear_reg() from the tidymodels library.
+
+```{r}
+# Mise à jour des colonnes à garder pour l'entraînement
+columns_for_training <- c("return", "fwd_return", "fed_rate", "inflation", "d2e", "dy", "prof_marg", "revenue")
+
+# Séparation des données en ensembles d'entraînement et de test
 set.seed(123)
-data_split <- initial_split(selected_data, prop = 0.8)
+data_split <- initial_split(selected_data, prop = 0.7)
 train_data <- training(data_split)
 test_data <- testing(data_split)
 
+# Recette pour le prétraitement des données
 recipe <- recipe(vol_1y ~ ., data = train_data) %>%
-  step_rm(date, symbol, name, country_HQ, country_Risk, sector) %>% 
+  step_rm(date, symbol, name, close, mkt_cap, rec_mean, p2b, esg, scope_1, scope_2, scope_3, country_HQ, country_Risk, sector, gdp_growth, unemployment) %>%
   step_normalize(all_predictors())
 
+# Spécification du modèle
 model_spec <- linear_reg() %>%
   set_engine("lm")
 
+# Workflow
 workflow <- workflow() %>%
   add_recipe(recipe) %>%
   add_model(model_spec)
 
-
+# Entraînement du modèle
 model_fit <- workflow %>%
   fit(data = train_data)
 
-
+# Prédictions
 predictions <- model_fit %>%
   predict(new_data = test_data) %>%
   bind_cols(test_data)
 
-
+# Évaluation des métriques
 metrics <- predictions %>%
   metrics(truth = vol_1y, estimate = .pred)
 
 print(metrics)
 
+# Visualisation des prédictions vs valeurs réelles
 ggplot(predictions, aes(x = .pred, y = vol_1y)) +
   geom_point(alpha = 0.5) +
   geom_abline(slope = 1, intercept = 0, color = "red") +
@@ -122,56 +189,87 @@ ggplot(predictions, aes(x = .pred, y = vol_1y)) +
        y = "Actual vol_1y") +
   theme_minimal()
 
+# Sauvegarder le graphique
 ggsave("residual_plot.png", width = 8, height = 6)
 
 ```
+There are several things to note here.
+
+
+Firstly, there's a great deal of variance and disparity between the different volatilities observed (black dots). In fact, some of them have extreme values (around 2.5), which may reduce the accuracy of our model.
+
+
+Here, the red line corresponds to the values predicted by the model. As can be seen from the metrics table, the r squared is rather disappointing: Only 9.96% of the variance of the volatility values is explained by the chosen independent variables. However, this result is not necessarily surprising, as we had previously observed that no variable was strongly correlated with the vol_1y column.
+
+The aim now is to improve the accuracy of our model using more advanced machine learning algorithms.
+
+# Random Forest
+
+The first test is carried out using a random forest. This is a supervised learning method that combines several trees, each constructed from a random sample of the data and a random selection of features at each node. Final predictions are obtained by aggregating the predictions of all the trees.
+
+
+To reduce the computation time of the algorithm, we will use only a sample of the data (10%) and choose a reasonable number of trees (125).
 
 ```{r}
 
-sample_proportion <- 0.05 
+library(tidymodels)
+library(parallel)
+library(doParallel)
 
+# Proportion de l'échantillon
+sample_proportion <- 0.10 
+
+# Échantillonnage des données
 set.seed(123) 
 sampled_data <- spx_macro %>%
   sample_frac(sample_proportion)
 
 print(paste("Number of observations in sampled data:", nrow(sampled_data)))
 
+# Définir les colonnes à utiliser pour l'entraînement
+columns_for_training <- c("return", "fwd_return", "fed_rate", "inflation", "d2e", "dy", "prof_marg", "revenue", "vol_1y")
+
+# Sélectionner les colonnes spécifiées
 selected_data <- sampled_data %>%
-  select(all_of(columns_to_use)) %>%
+  select(all_of(columns_for_training)) %>%
   drop_na()
 
+# Séparation des données en ensembles d'entraînement et de test
 set.seed(123)
 data_split <- initial_split(selected_data, prop = 0.8)
 train_data <- training(data_split)
 test_data <- testing(data_split)
 
-
+# Recette pour le prétraitement des données
 recipe <- recipe(vol_1y ~ ., data = train_data) %>%
-  step_rm(date, symbol, name, country_HQ, country_Risk, sector) %>% 
   step_normalize(all_predictors())
 
+# Spécification du modèle Random Forest
 model_spec <- rand_forest(
   mtry = tune(),
-  trees = 100, 
+  trees = 120, 
   min_n = tune()
 ) %>%
   set_engine("randomForest") %>%
   set_mode("regression")
 
-
+# Workflow
 workflow <- workflow() %>%
   add_recipe(recipe) %>%
   add_model(model_spec)
 
+# Réduire la taille de la grille de recherche
 tune_grid <- grid_regular(
-  mtry(range = c(2, 10)),
-  min_n(range = c(5, 20)),
-  levels = 5
+  mtry(range = c(2, 5)),
+  min_n(range = c(5, 10)),
+  levels = 3
 )
 
+# Configuration du parallélisme
 cl <- makeCluster(detectCores() - 1)
 registerDoParallel(cl)
 
+# Optimisation des hyperparamètres
 set.seed(123)
 tune_res <- tune_grid(
   workflow,
@@ -180,26 +278,32 @@ tune_res <- tune_grid(
   control = control_grid(verbose = TRUE, save_pred = TRUE)
 )
 
-
+# Arrêt du parallélisme
 stopCluster(cl)
 registerDoSEQ()
 
+# Sélection du meilleur modèle
 best_model <- tune_res %>% select_best(metric = "rmse")
 print(best_model)
 
+# Finalisation du workflow avec les meilleurs hyperparamètres
 final_workflow <- workflow %>% finalize_workflow(best_model)
 
+# Entraînement du modèle final
 final_fit <- final_workflow %>% fit(data = train_data)
 
+# Prédictions sur l'ensemble de test
 predictions <- final_fit %>%
   predict(new_data = test_data) %>%
   bind_cols(test_data)
 
+# Calcul des métriques d'évaluation
 metrics <- predictions %>%
   metrics(truth = vol_1y, estimate = .pred)
 
 print(metrics)
 
+# Visualisation des prédictions vs valeurs réelles
 ggplot(predictions, aes(x = .pred, y = vol_1y)) +
   geom_point(alpha = 0.5) +
   geom_abline(slope = 1, intercept = 0, color = "red") +
@@ -208,87 +312,72 @@ ggplot(predictions, aes(x = .pred, y = vol_1y)) +
        y = "Actual vol_1y") +
   theme_minimal()
 
+# Sauvegarder le graphique
+ggsave("rf_residual_plot.png", width = 8, height = 6)
 
-ggsave("residual_plot.png", width = 8, height = 6)
 ```
-
+We can see here that, following random forest, the results are much better than with simple linear regression. The r-squared has risen to 51%, which is still insufficient, but much better than before.
 
 ```{r}
 
+# Charger les packages nécessaires
+library(caret)
+library(xgboost)
+library(dplyr)
+library(ggplot2)
+library(tidymodels)
+
+# Proportion de l'échantillon
 sample_proportion <- 0.05 
 
-set.seed(123)
+# Échantillonnage des données
+set.seed(123) 
 sampled_data <- spx_macro %>%
   sample_frac(sample_proportion)
 
 print(paste("Number of observations in sampled data:", nrow(sampled_data)))
 
+# Définir les colonnes à utiliser pour l'entraînement
+columns_for_training <- c("return", "fwd_return", "fed_rate", "inflation", "d2e", "dy", "prof_marg", "revenue", "vol_1y")
+
+# Sélectionner les colonnes spécifiées
 selected_data <- sampled_data %>%
-  select(all_of(columns_to_use)) %>%
+  select(all_of(columns_for_training)) %>%
   drop_na()
 
+# Séparation des données en ensembles d'entraînement et de test
 set.seed(123)
-data_split <- initial_split(selected_data, prop = 0.8)
-train_data <- training(data_split)
-test_data <- testing(data_split)
+trainIndex <- createDataPartition(selected_data$vol_1y, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train_data <- selected_data[ trainIndex,]
+test_data  <- selected_data[-trainIndex,]
 
-recipe <- recipe(vol_1y ~ ., data = train_data) %>%
-  step_rm(date, symbol, name, country_HQ, country_Risk, sector) %>%
-  step_normalize(all_predictors())
+# Prétraitement des données: normalisation
+preProcValues <- preProcess(train_data, method = c("center", "scale"))
+train_data <- predict(preProcValues, train_data)
+test_data <- predict(preProcValues, test_data)
 
+# Spécification du modèle XGBoost
+set.seed(123)
+xgb_model <- train(vol_1y ~ ., data = train_data, method = "xgbTree", 
+                   trControl = trainControl(method = "cv", number = 5),
+                   tuneLength = 5)
 
-model_spec <- boost_tree(
-  trees = 100,  
-  tree_depth = tune(),
-  learn_rate = tune(),
-  mtry = tune()
-) %>%
-  set_engine("xgboost") %>%
-  set_mode("regression")
+# Prédictions sur l'ensemble de test
+predictions <- predict(xgb_model, newdata = test_data)
 
-
-workflow <- workflow() %>%
-  add_recipe(recipe) %>%
-  add_model(model_spec)
-
-tune_grid <- grid_regular(
-  tree_depth(range = c(3, 6)),  
-  learn_rate(range = c(0.01, 0.1)), 
-  mtry(range = c(3, 6)),  
-  levels = 3  
+# Calcul des métriques d'évaluation
+results <- data.frame(
+  RMSE = RMSE(predictions, test_data$vol_1y),
+  Rsquared = R2(predictions, test_data$vol_1y),
+  MAE = MAE(predictions, test_data$vol_1y)
 )
 
-cl <- makeCluster(detectCores() - 1)
-registerDoParallel(cl)
+print(results)
 
-
-set.seed(123)
-tune_res <- tune_grid(
-  workflow,
-  resamples = vfold_cv(train_data, v = 3), 
-  control = control_grid(verbose = TRUE, save_pred = TRUE)
-)
-
-stopCluster(cl)
-registerDoSEQ()
-
-best_model <- tune_res %>% select_best(metric = "rmse")
-print(best_model)
-
-final_workflow <- workflow %>% finalize_workflow(best_model)
-
-final_fit <- final_workflow %>% fit(data = train_data)
-
-predictions <- final_fit %>%
-  predict(new_data = test_data) %>%
-  bind_cols(test_data)
-
-metrics <- predictions %>%
-  metrics(truth = vol_1y, estimate = .pred)
-
-print(metrics)
-
-ggplot(predictions, aes(x = .pred, y = vol_1y)) +
+# Visualisation des prédictions vs valeurs réelles
+ggplot(data = data.frame(Predicted = predictions, Actual = test_data$vol_1y), aes(x = Predicted, y = Actual)) +
   geom_point(alpha = 0.5) +
   geom_abline(slope = 1, intercept = 0, color = "red") +
   labs(title = "Predicted vs Actual vol_1y",
@@ -296,8 +385,8 @@ ggplot(predictions, aes(x = .pred, y = vol_1y)) +
        y = "Actual vol_1y") +
   theme_minimal()
 
-ggsave("residual_plot.png", width = 8, height = 6)
-
+# Sauvegarder le graphique
+ggsave("xgb_residual_plot.png", width = 8, height = 6)
 
 ```
 
