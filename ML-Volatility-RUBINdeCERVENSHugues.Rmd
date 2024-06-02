@@ -1,0 +1,450 @@
+---
+title: "Machine Learning with R - Hugues Rubin de Cervens"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Introduction
+
+In the financial markets, share prices are affected by a large number of macroeconomic factors (interest rate levels, inflation, unemployment rates, etc.), geopolitical factors (international conflicts, economic sanctions, etc.) and internal company factors (changes in management, mergers and acquisitions, etc.). As a result, certain situations can cause financial markets to become extremely volatile.
+
+Measuring historical and implied volatility is very important, as it enables us to measure the risks associated with asset price movements. Predicting volatility makes it possible not only to anticipate market movements, but also to price certain derivatives, such as options.
+
+Therefore, the aim of this project is to predict the volatility of the S&P500 as accurately as possible, using machine learning tools
+
+
+```{r}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(tidymodels))
+suppressPackageStartupMessages(library(ranger))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(gridExtra))
+suppressPackageStartupMessages(library(doParallel))
+suppressPackageStartupMessages(library(parallel))
+suppressPackageStartupMessages(library(xgboost))
+suppressPackageStartupMessages(library(randomForest))
+suppressPackageStartupMessages(library(caret))
+suppressPackageStartupMessages(library(caretEnsemble))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(car))
+
+
+```
+
+# Data sets and correlation
+
+The proposed dataset contains various information on the stocks making up the s&p500. It includes company-specific factors (historical volatility, budget capitalization, closing price, etc.) as well as macro-economic data for the corresponding dates (inflation, key rates, etc.).
+
+```{r}
+load("C:/Users/hugue/Downloads/spx_macro.RData")
+head(spx_macro)
+names(spx_macro)
+
+```
+In an attempt to predict volatility, the first step is to analyze the correlation between each column and the target (vol_1y), in order to keep only those columns that could have a significant impact on the model's accuracy.
+
+```{r}
+
+obs_count <- nrow(spx_macro)
+print(paste("Number of observations:", obs_count))
+columns <- c("date", "symbol", "name", "close", "vol_1y", "revenue", "mkt_cap", 
+             "rec_mean", "p2b", "d2e", "prof_marg", "dy", "esg", "scope_1", 
+             "scope_2", "scope_3", "country_HQ", "country_Risk", "sector", 
+             "return", "fwd_return", "inflation", "gdp_growth", "unemployment", 
+             "fed_rate")
+
+data_selected <- spx_macro %>%
+  select(all_of(columns)) %>%
+  drop_na()
+
+corr_matrix <- cor(data_selected %>% select(-c(date, symbol, name, country_HQ, country_Risk, sector)))
+
+corr_vol1y <- corr_matrix[, "vol_1y"]
+corr_df <- data.frame(
+  Variable = names(corr_vol1y),
+  Correlation = corr_vol1y
+)
+
+corr_df <- corr_df[corr_df$Variable != "vol_1y", ]
+
+ggplot(corr_df, aes(x = reorder(Variable, Correlation), y = Correlation)) + geom_bar(stat = "identity", fill = "red") + coord_flip() + labs(title = "Correlation of each Variable with vol_1y",
+       x = "Variable",
+       y = "Correlation") + theme_minimal() + theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank())
+
+ggsave("correlation_plot.png", width = 12, height = 8)
+
+```
+As can be seen above, the first observation is that none of the variables appear to be highly correlated (positively or negatively) with the target column (vol_1y). Before choosing which columns to keep, we also need to analyze multicollinearity between variables, using the VIF test (Variance Inflation Factors).
+
+
+```{r}
+
+num_vars <- sapply(spx_macro, is.numeric)
+data_numeric <- spx_macro[, num_vars]
+print(names(data_numeric))
+
+model_alias <- lm(vol_1y ~ ., data = data_numeric)
+cols_colinear <- alias(model_alias)$Complete
+
+if (length(cols_colinear) > 0) {
+  data_numeric <- data_numeric %>% select(-one_of(names(cols_colinear)))
+}
+
+model_vif <- lm(vol_1y ~ ., data = data_numeric)
+vif_vals <- vif(model_vif)
+
+vif_data <- data.frame(
+  Variable = names(vif_vals),
+  VIF = vif_vals
+)
+
+ggplot(vif_data, aes(x = reorder(Variable, VIF), y = VIF)) +
+  geom_bar(stat = "identity", fill = "darkorange") + coord_flip() + labs(title = "Variance Inflation Factors (VIF)",
+       x = "Variable",
+       y = "VIF") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank())
+
+ggsave("vif_plot.png", width = 12, height = 8)
+
+```
+As can be seen from the graph above, none of the independent variables has an VIF greater than 5, meaning that none of these variables show signs of strong multicollinearity with the others.
+
+Thus, in order to simplify the machine learning model as much as possible, reduce complexity and avoid long computation times, we will keep here the variables most correlated with vol_1y, i.e. :
+
+- return
+- fwd_return
+- fed_rate
+- inflation
+- d2e
+- dy
+- prof_marg
+- revenue
+
+# First linear regression model
+
+The first model we're going to run here is a relatively simple one: a basic linear regression model in which the dataset is split into two parts: one part for training the model (here 70% of the dataset) and a second part for testing the model (30%). The regression model is created using linear_reg() from the tidymodels library.
+
+```{r}
+
+train_cols <- c("return", "fwd_return", "fed_rate", "inflation", "d2e", "dy", "prof_marg", "revenue")
+
+set.seed(123)
+data_part <- initial_split(data_selected, prop = 0.7)
+train_set <- training(data_part)
+test_set <- testing(data_part)
+prep_recipe <- recipe(vol_1y ~ ., data = train_set) %>%
+  step_rm(date, symbol, name, close, mkt_cap, rec_mean, p2b, esg, scope_1, scope_2, scope_3, country_HQ, country_Risk, sector, gdp_growth, unemployment) %>%
+  step_normalize(all_predictors())
+
+model_def <- linear_reg() %>%
+  set_engine("lm")
+workflow_def <- workflow() %>%
+  add_recipe(prep_recipe) %>%
+  add_model(model_def)
+
+trained_model <- workflow_def %>%
+  fit(data = train_set)
+pred_results <- trained_model %>%
+  predict(new_data = test_set) %>%
+  bind_cols(test_set)
+
+eval_metrics <- pred_results %>%
+  metrics(truth = vol_1y, estimate = .pred)
+print(eval_metrics)
+
+ggplot(pred_results, aes(x = .pred, y = vol_1y)) +
+  geom_point(alpha = 0.5, color = "darkblue") +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Predicted vs Actual vol_1y",
+       x = "Predicted vol_1y",
+       y = "Actual vol_1y") + theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank())
+
+ggsave("result_plot.png", width = 8, height = 6)
+
+
+```
+There are several things to note here.
+
+
+Firstly, there's a great deal of variance and disparity between the different volatilities observed (black dots). In fact, some of them have extreme values (around 2.5), which may reduce the accuracy of our model.
+
+
+Here, the red line corresponds to the values predicted by the model. As can be seen from the metrics table, the r squared is rather disappointing: Only 9.96% of the variance of the volatility values is explained by the chosen independent variables. However, this result is not necessarily surprising, as we had previously observed that no variable was strongly correlated with the vol_1y column.
+
+The aim now is to improve the accuracy of our model using more advanced machine learning algorithms.
+
+# Random Forest
+
+The first test is carried out using a random forest. This is a supervised learning method that combines several trees, each constructed from a random sample of the data and a random selection of features at each node. Final predictions are obtained by aggregating the predictions of all the trees.
+
+
+To reduce the computation time of the algorithm, we will use only a sample of the data (10%) and choose a reasonable number of trees (100).
+
+```{r}
+
+sample_size <- 0.10 
+
+set.seed(123) 
+data_sample <- spx_macro %>%
+  sample_frac(sample_size)
+
+train_cols <- c("return", "fwd_return", "fed_rate", "inflation", "d2e", "dy", "prof_marg", "revenue", "vol_1y")
+
+data_selected <- data_sample %>%
+  select(all_of(train_cols)) %>%
+  drop_na()
+
+set.seed(123)
+split_data <- initial_split(data_selected, prop = 0.7)
+train_set <- training(split_data)
+test_set <- testing(split_data)
+
+prep_data <- recipe(vol_1y ~ ., data = train_set) %>%
+  step_normalize(all_predictors())
+
+forest_model <- rand_forest(
+  mtry = tune(),
+  trees = 100, 
+  min_n = tune()
+) %>%
+  set_engine("randomForest") %>%
+  set_mode("regression")
+
+model_workflow <- workflow() %>%
+  add_recipe(prep_data) %>%
+  add_model(forest_model)
+grid_search <- grid_regular(
+  mtry(range = c(2, 5)),
+  min_n(range = c(5, 10)),
+  levels = 3
+)
+
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+set.seed(123)
+tune_results <- tune_grid(
+  model_workflow,
+  resamples = vfold_cv(train_set, v = 3),
+  grid = grid_search,
+  control = control_grid(verbose = TRUE, save_pred = TRUE)
+)
+
+stopCluster(cluster)
+registerDoSEQ()
+
+optimal_model <- tune_results %>% select_best(metric = "rmse")
+print(optimal_model)
+
+final_model_workflow <- model_workflow %>% finalize_workflow(optimal_model)
+
+final_model <- final_model_workflow %>% fit(data = train_set)
+predicted_values <- final_model %>%
+  predict(new_data = test_set) %>%
+  bind_cols(test_set)
+eval_metrics <- predicted_values %>%
+  metrics(truth = vol_1y, estimate = .pred)
+
+print(eval_metrics)
+ggplot(predicted_values, aes(x = .pred, y = vol_1y)) + geom_point(alpha = 0.5, color = "darkblue") + geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Predicted vs Actual vol_1y",
+       x = "Predicted volatility",
+       y = "Historical volatility") + theme_minimal() +
+  theme( plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank())
+
+ggsave("random_forest_results.png", width = 8, height = 6)
+
+
+```
+We can see here that, following random forest, the results are much better than with simple linear regression. The r-squared has risen to 51%, which is still insufficient, but much better than before.
+
+
+
+# Gradient Boosting Machine & Random Forest
+
+The aim now is to improve the accuracy of our model by coupling random forest with another machine learning algorithm: the gradient boosting machine, which builds chain regression models, where each new model is based on the previous one, correcting its errors.
+
+
+As the two algorithms are complementary in their approaches, we can try to mix them here.
+
+```{r}
+
+sample_size <- 0.10
+
+set.seed(123)
+data_sample <- spx_macro %>%
+  sample_frac(sample_size)
+
+data_selected <- data_sample %>%
+  select(all_of(train_cols)) %>%
+  drop_na()
+
+set.seed(123)
+split_index <- createDataPartition(data_selected$vol_1y, p = .8, 
+                                   list = FALSE, 
+                                   times = 1)
+train_set <- data_selected[split_index,]
+test_set <- data_selected[-split_index,]
+prep_values <- preProcess(train_set, method = c("center", "scale"))
+train_set <- predict(prep_values, train_set)
+test_set <- predict(prep_values, test_set)
+
+base_models <- caretList(
+  vol_1y ~ ., data = train_set,
+  trControl = trainControl(method = "cv", number = 5),
+  methodList = NULL,
+  tuneList = list(
+    rf = caretModelSpec(method = "rf", tuneGrid = expand.grid(mtry = 2), ntree = 100),
+    xgbTree = caretModelSpec(method = "xgbTree", tuneGrid = expand.grid(
+      nrounds = 100, 
+      max_depth = 3, 
+      eta = 0.1, 
+      gamma = 0, 
+      colsample_bytree = 1, 
+      min_child_weight = 1, 
+      subsample = 1
+    ))
+  )
+)
+
+set.seed(123)
+ensemble_fit <- caretEnsemble(
+  base_models, 
+  metric = "RMSE",
+  trControl = trainControl(method = "cv", number = 5)
+)
+
+preds <- predict(ensemble_fit, newdata = test_set)
+eval_results <- data.frame(
+  RMSE = RMSE(preds, test_set$vol_1y),
+  Rsquared = R2(preds, test_set$vol_1y),
+  MAE = MAE(preds, test_set$vol_1y)
+)
+print(eval_results)
+
+ggplot(data = data.frame(Predicted = preds, Actual = test_set$vol_1y), aes(x = Predicted, y = Actual)) + geom_point(alpha = 0.5, color = "darkblue") + geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Predicted vs Actual vol_1y",
+       x = "Predicted vol_1y",
+       y = "Actual vol_1y") +
+  theme_minimal()
+
+ggsave("ensemble_residual_plot.png", width = 8, height = 6)
+
+
+```
+Unfortunately, the results here are no better than with random forest. The r-squared is 0.46, and the RMSE and MAE errors are also higher than with the basic random forest model. This can be explained by the fact that we are testing our model only on a sample of the data. It can also be explained by noise. Volatility data tend to vary widely at random, which can make it very difficult to define an accurate linear regression model. Noise can make it difficult for machine learning models to distinguish true patterns from random fluctuations, and models can end up “learning” noise rather than meaningful relationships.
+
+# Residuals and importance of the variables
+
+Following these results, it is interesting to observe the residuals, i.e. the difference between the predicted and observed values.
+
+```{r}
+
+residuals_data <- data.frame(Residuals = preds - test_set$vol_1y)
+ggplot(residuals_data, aes(x = Residuals)) +
+  geom_histogram(aes(y = ..density..), bins = 100, fill = "darkblue", alpha = 0.7) +
+  stat_function(fun = dnorm, args = list(mean = mean(residuals_data$Residuals), sd = sd(residuals_data$Residuals)), color = "red", size = 1) +
+  labs(title = "Distribution of Residuals",
+       x = "Residuals",
+       y = "Density") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank()
+  )
+
+ggsave("residuals_distribution.png", width = 8, height = 6)
+
+
+```
+
+Here, the distribution of residuals is globally centered around zero, showing that the prediction errors are symmetrical and that there is no systematic bias in the predictions. Furthermore, the shape of the distribution is close to a normal distribution, suggesting that the model captures well the relationships in the data, and that the errors are random and uncorrelated. However, there are some very high residuals (both positive and negative), which may indicate observations where the model has not performed well.
+
+```{r}
+
+forest_model <- base_models$rf
+forest_importance <- varImp(forest_model)
+forest_importance_df <- data.frame(Variable = rownames(forest_importance$importance), Importance = forest_importance$importance$Overall)
+
+forest_importance_df <- forest_importance_df %>%
+  mutate(Percentage = Importance / sum(Importance) * 100) %>%
+  arrange(desc(Importance)) %>%
+  mutate(Label = paste0(Variable, " (", round(Percentage, 1), "%)"))
+
+boost_model <- base_models$xgbTree
+boost_importance <- xgb.importance(model = boost_model$finalModel)
+boost_importance_df <- data.frame(Variable = boost_importance$Feature, Importance = boost_importance$Gain)
+boost_importance_df <- boost_importance_df %>%
+  mutate(Percentage = Importance / sum(Importance) * 100) %>%
+  arrange(desc(Importance)) %>%
+  mutate(Label = paste0(Variable, " (", round(Percentage, 1), "%)"))
+
+ggplot(forest_importance_df, aes(x = "", y = Importance, fill = Label)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = Label), position = position_stack(vjust = 0.5), size = 3) +
+  labs(title = "Variable Importance - Random Forest") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "none"
+  )
+
+ggsave("rf_variable_importance_pie.png", width = 8, height = 6)
+ggplot(boost_importance_df, aes(x = "", y = Importance, fill = Label)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = Label), position = position_stack(vjust = 0.5), size = 3) +
+  labs(title = "Variable Importance - XGBoost") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "none")
+ggsave("xgb_variable_importance_pie.png", width = 8, height = 6)
+
+
+```
+It is also interesting to observe the importance of the variables used for the two algorithms, random forest and GBM. Unsurprisingly, the variable with the greatest influence on both models is the return variable. Finally, the inflation variable is used very little in the predictive models.
+
+# Conclusion
+
+In conclusion, the models tested produced decent results, but not really precise enough. This lack of precision can be explained by several factors: 
+
+- Firstly, these models were tested with only a limited sample of data and a limited number of hyperparameters. Indeed, in order to obtain a relatively short calculation time (less than 2 min), it was necessary here to make sacrifices in complexity (reduced number of columns, relatively low number of learners, shallow trees, etc.). 
+
+- The second reason has to do with the data itself. Volatility is a type of data that contains a lot of noise. As a result, random forest and GBM may have difficulty in correctly capturing the patterns of this complex type of data.
+
+- Finally, it would have been interesting here to create new variables from existing ones, such as technical variables (RSI, Boellinger band, moving averages, etc.). However, this would have added complexity to the model, consuming more time and resources. Keeping only the basic data prevents overfitting, as the risk of capturing noise in the data is reduced.
+
